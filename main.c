@@ -5,8 +5,10 @@
 #include <wchar.h>
 #include <time.h>
 
+// Порядок этих трех строк СТРОГО обязателен!
 #include <winsock2.h>
 #include <windows.h>
+#include <commdlg.h>
 
 #ifndef min
 #define min(a,b) (((a) < (b)) ? (a) : (b))
@@ -21,34 +23,41 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "curl.lib")
 #pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "comdlg32.lib")
 
 // --- Глобальные переменные ---
 ULONG_PTR gdiplusToken;
 GpImage*  currentImage = NULL;
-HWND hButton = NULL;
+HWND hButtonNext, hButtonSave, hEditTag, hRadioImg, hRadioGif;
 #define ID_BTN_NEXT 101
+#define ID_BTN_SAVE 102
+#define ID_EDIT_TAG 103
+#define ID_RADIO_IMG 104
+#define ID_RADIO_GIF 105
+#define ID_TIMER_GIF 201
 
-// --- Функция для правильного перевода UTF-8 в Unicode (спасает от кракозябр) ---
-wchar_t* wstr(const char* str) {
-    static wchar_t buf[256];
-    MultiByteToWideChar(CP_UTF8, 0, str, -1, buf, 256);
-    return buf;
-}
+// Переменные для GIF
+UINT gifFrameCount = 0;
+UINT gifCurrentFrame = 0;
+UINT* gifFrameDelays = NULL;
+GUID gifFrameDimension;
+BOOL isGifLoaded = FALSE;
+WCHAR currentFilePath[MAX_PATH] = L"cat.jpg";
 
+// --- Прототипы ---
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
-void DownloadAndLoadCat(HWND hwnd);
+void LoadCat(HWND hwnd);
+void SaveCurrentFile(HWND hwnd);
 static size_t write_callback(void* contents, size_t size, size_t nmemb, void* userp);
+void StopGifAnimation(HWND hwnd);
 
 // --- Функция скачивания ---
-int download_file(const char* url, const char* filename, CURLcode* out_res, long* out_http) {
+int download_file(const char* url, const char* filename) {
     CURL* curl = curl_easy_init();
     if (!curl) return -1;
 
     FILE* file = fopen(filename, "wb");
-    if (!file) { 
-        curl_easy_cleanup(curl); 
-        return -3; // Ошибка: файл заблокирован или нет прав на запись
-    }
+    if (!file) { curl_easy_cleanup(curl); return -3; }
 
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
@@ -59,104 +68,214 @@ int download_file(const char* url, const char* filename, CURLcode* out_res, long
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
 
-    *out_res = curl_easy_perform(curl);
-    *out_http = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, out_http);
-
+    CURLcode res = curl_easy_perform(curl);
     fclose(file);
     curl_easy_cleanup(curl);
 
-    if (*out_res != CURLE_OK) return -1;
-    if (*out_http >= 400) return -2;
-
-    return 0;
+    return (res == CURLE_OK) ? 0 : -1;
 }
 
 static size_t write_callback(void* contents, size_t size, size_t nmemb, void* userp) {
     return fwrite(contents, size, nmemb, (FILE*)userp);
 }
 
-// --- Загрузка котика в окно ---
-void DownloadAndLoadCat(HWND hwnd) {
-    SetWindowTextW(hwnd, wstr("Загрузка..."));
-    SetWindowTextW(hButton, wstr("Ждите..."));
-    EnableWindow(hButton, FALSE);
+// --- Остановка анимации ---
+void StopGifAnimation(HWND hwnd) {
+    KillTimer(hwnd, ID_TIMER_GIF);
+    if (gifFrameDelays) {
+        free(gifFrameDelays);
+        gifFrameDelays = NULL;
+    }
+    gifFrameCount = 0;
+    gifCurrentFrame = 0;
+    isGifLoaded = FALSE;
+}
 
-    // КРИТИЧЕСКИ ВАЖНО: Освобождаем старый файл ДО скачивания нового!
-    // Иначе Windows не даст перезаписать cat.jpg, и мы получим ложную ошибку сети.
+// --- Загрузка ---
+void LoadCat(HWND hwnd) {
+    StopGifAnimation(hwnd);
+
     if (currentImage) {
         GdipDisposeImage(currentImage);
         currentImage = NULL;
     }
 
-    char url[256];
-    sprintf(url, "https://cataas.com/cat?t=%d", (int)time(NULL));
-    const char* filename = "cat.jpg";
+    WCHAR wTag[128] = L"";
+    GetWindowTextW(hEditTag, wTag, 128);
+    
+    char utf8Tag[256] = "";
+    WideCharToMultiByte(CP_UTF8, 0, wTag, -1, utf8Tag, 256, NULL, NULL);
 
-    CURLcode res = CURLE_OK; 
-    long http_code = 0;
-    int dl_status = download_file(url, filename, &res, &http_code);
+    BOOL wantGif = (SendMessage(hRadioGif, BM_GETCHECK, 0, 0) == BST_CHECKED);
 
-    if (dl_status == 0) {
-        WCHAR wFilename[MAX_PATH];
-        MultiByteToWideChar(CP_ACP, 0, filename, -1, wFilename, MAX_PATH);
-        
-        WCHAR fullPath[MAX_PATH];
-        GetFullPathNameW(wFilename, MAX_PATH, fullPath, NULL);
-        
-        GpStatus status = GdipLoadImageFromFile(fullPath, &currentImage);
-        
-        if (status == Ok) {
-            SetWindowTextW(hwnd, wstr("Случайный мем с котиком"));
-        } else {
-            WCHAR errMsg[512];
-            swprintf(errMsg, 512, L"GDI+ error: %d", status);
-            MessageBoxW(hwnd, errMsg, wstr("Ошибка картинки"), MB_ICONERROR);
-            SetWindowTextW(hwnd, wstr("Ошибка чтения"));
-        }
-    } else if (dl_status == -3) {
-        MessageBoxW(hwnd, wstr("Не удалось открыть файл cat.jpg для записи.\nВозможно, он заблокирован другой программой."), wstr("Ошибка файла"), MB_ICONERROR);
-        SetWindowTextW(hwnd, wstr("Ошибка файла"));
-    } else if (dl_status == -2) {
-        WCHAR errMsg[512];
-        swprintf(errMsg, 512, L"HTTP код: %ld\nСайт может блокировать спам.", http_code);
-        MessageBoxW(hwnd, errMsg, wstr("Ошибка сети"), MB_ICONERROR);
-        SetWindowTextW(hwnd, wstr("Ошибка скачивания"));
+    char url[512];
+    if (wantGif) {
+        sprintf(url, "https://cataas.com/cat/gif?t=%d", (int)time(NULL));
     } else {
-        WCHAR errMsg[512];
-        const char* curl_err = curl_easy_strerror(res);
-        WCHAR wErr[256];
-        MultiByteToWideChar(CP_ACP, 0, curl_err, -1, wErr, 256);
-        swprintf(errMsg, 512, L"curl: %s (Code: %d)", wErr, res);
-        MessageBoxW(hwnd, errMsg, wstr("Ошибка сети"), MB_ICONERROR);
-        SetWindowTextW(hwnd, wstr("Ошибка скачивания"));
+        if (strlen(utf8Tag) > 0) {
+            sprintf(url, "https://cataas.com/cat/%s?t=%d", utf8Tag, (int)time(NULL));
+        } else {
+            sprintf(url, "https://cataas.com/cat?t=%d", (int)time(NULL));
+        }
     }
 
-    SetWindowTextW(hButton, wstr("Следующий котик"));
-    EnableWindow(hButton, TRUE);
-    InvalidateRect(hwnd, NULL, TRUE);
+    SetWindowTextW(hwnd, L"Загрузка...");
+    EnableWindow(hButtonNext, FALSE);
+    
+    if (download_file(url, "cat.tmp") != 0) {
+        MessageBoxW(hwnd, L"Ошибка сети. Проверьте интернет.", L"Ошибка", MB_ICONERROR);
+        EnableWindow(hButtonNext, TRUE);
+        SetWindowTextW(hwnd, L"Ошибка");
+        return;
+    }
+
+    WCHAR wTempPath[MAX_PATH];
+    GetFullPathNameW(L"cat.tmp", MAX_PATH, wTempPath, NULL);
+    
+    WCHAR wFinalPath[MAX_PATH];
+    if (wantGif) {
+        wcscpy(wFinalPath, L"cat.gif");
+    } else {
+        wcscpy(wFinalPath, L"cat.jpg");
+    }
+    wcscpy(currentFilePath, wFinalPath);
+
+    DeleteFileW(wFinalPath);
+    MoveFileW(wTempPath, wFinalPath);
+
+    GpStatus status = GdipLoadImageFromFile(wFinalPath, &currentImage);
+    if (status != Ok) {
+        MessageBoxW(hwnd, L"Не удалось прочитать файл.", L"Ошибка", MB_ICONERROR);
+        EnableWindow(hButtonNext, TRUE);
+        return;
+    }
+
+    if (wantGif) {
+        UINT count = 0;
+        GdipImageGetFrameDimensionsCount(currentImage, &count);
+        if (count > 0) {
+            GUID* dimIDs = (GUID*)malloc(sizeof(GUID) * count);
+            GdipImageGetFrameDimensionsList(currentImage, dimIDs, count);
+            gifFrameDimension = dimIDs[0];
+            free(dimIDs);
+
+            GdipImageGetFrameCount(currentImage, &gifFrameDimension, &gifFrameCount);
+            if (gifFrameCount > 1) {
+                UINT size = 0;
+                if (GdipGetPropertyItemSize(currentImage, PropertyTagFrameDelay, &size) == Ok) {
+                    PropertyItem* prop = (PropertyItem*)malloc(size);
+                    if (GdipGetPropertyItem(currentImage, PropertyTagFrameDelay, size, prop) == Ok) {
+                        gifFrameDelays = (UINT*)malloc(prop->length);
+                        memcpy(gifFrameDelays, prop->value, prop->length);
+                        
+                        gifCurrentFrame = 0;
+                        isGifLoaded = TRUE;
+                        
+                        GdipImageSelectActiveFrame(currentImage, &gifFrameDimension, gifCurrentFrame);
+                        
+                        UINT delay = gifFrameDelays[gifCurrentFrame] * 10;
+                        if (delay < 20) delay = 100; 
+                        SetTimer(hwnd, ID_TIMER_GIF, delay, NULL);
+                    }
+                    free(prop);
+                }
+            }
+        }
+    }
+
+    EnableWindow(hButtonNext, TRUE);
+    SetWindowTextW(hwnd, L"Случайный мем с котиком");
+    InvalidateRect(hwnd, NULL, FALSE); // FALSE для предотвращения лишней очистки фона
+}
+
+// --- Сохранение ---
+void SaveCurrentFile(HWND hwnd) {
+    if (!currentImage) {
+        MessageBoxW(hwnd, L"Сначала загрузите котика.", L"Нет картинки", MB_ICONWARNING);
+        return;
+    }
+
+    OPENFILENAMEW ofn;
+    WCHAR szFileName[MAX_PATH] = L"cat_saved";
+    
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hwnd;
+    
+    BOOL isGif = (SendMessage(hRadioGif, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    if (isGif) {
+        ofn.lpstrFilter = L"GIF Files (*.gif)\0*.gif\0All Files (*.*)\0*.*\0";
+        wcscat(szFileName, L".gif");
+        ofn.lpstrDefExt = L"gif";
+    } else {
+        ofn.lpstrFilter = L"JPEG Files (*.jpg)\0*.jpg\0All Files (*.*)\0*.*\0";
+        wcscat(szFileName, L".jpg");
+        ofn.lpstrDefExt = L"jpg";
+    }
+    
+    ofn.lpstrFile = szFileName;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.Flags = OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY;
+    
+    if (GetSaveFileNameW(&ofn)) {
+        if (CopyFileW(currentFilePath, ofn.lpstrFile, FALSE)) {
+            MessageBoxW(hwnd, L"Файл успешно сохранен!", L"Успех", MB_ICONINFORMATION);
+        } else {
+            MessageBoxW(hwnd, L"Не удалось скопировать файл.", L"Ошибка", MB_ICONERROR);
+        }
+    }
 }
 
 // --- Оконная процедура ---
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE:
-        hButton = CreateWindowW(L"BUTTON", wstr("Следующий котик"),
-            WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
-            0, 0, 0, 0, hwnd, (HMENU)ID_BTN_NEXT, NULL, NULL);
-        DownloadAndLoadCat(hwnd);
+        SetWindowTextW(hwnd, L"Случайный мем с котиком");
+
+        CreateWindowW(L"STATIC", L"Тег:", WS_VISIBLE | WS_CHILD, 10, 10, 40, 25, hwnd, NULL, NULL, NULL);
+        hEditTag = CreateWindowW(L"EDIT", L"", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL, 50, 10, 150, 25, hwnd, (HMENU)ID_EDIT_TAG, NULL, NULL);
+
+        hRadioImg = CreateWindowW(L"BUTTON", L"Картинка", WS_VISIBLE | WS_CHILD | BS_AUTORADIOBUTTON | WS_GROUP, 220, 10, 100, 25, hwnd, (HMENU)ID_RADIO_IMG, NULL, NULL);
+        hRadioGif = CreateWindowW(L"BUTTON", L"GIF", WS_VISIBLE | WS_CHILD | BS_AUTORADIOBUTTON, 330, 10, 60, 25, hwnd, (HMENU)ID_RADIO_GIF, NULL, NULL);
+        SendMessage(hRadioImg, BM_SETCHECK, BST_CHECKED, 0);
+
+        hButtonNext = CreateWindowW(L"BUTTON", L"Следующий котик", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 10, 500, 180, 35, hwnd, (HMENU)ID_BTN_NEXT, NULL, NULL);
+        hButtonSave = CreateWindowW(L"BUTTON", L"Сохранить", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 200, 500, 150, 35, hwnd, (HMENU)ID_BTN_SAVE, NULL, NULL);
+
+        LoadCat(hwnd);
         break;
+
+    case WM_TIMER:
+        if (wParam == ID_TIMER_GIF && isGifLoaded && gifFrameCount > 0) {
+            gifCurrentFrame = (gifCurrentFrame + 1) % gifFrameCount;
+            GdipImageSelectActiveFrame(currentImage, &gifFrameDimension, gifCurrentFrame);
+            
+            if (gifFrameDelays) {
+                UINT delay = gifFrameDelays[gifCurrentFrame] * 10;
+                if (delay < 20) delay = 100;
+                KillTimer(hwnd, ID_TIMER_GIF);
+                SetTimer(hwnd, ID_TIMER_GIF, delay, NULL);
+            }
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        break;
+
+    case WM_ERASEBKGND:
+        return 1; // Отключаем стандартную очистку фона (лечит мерцание)
 
     case WM_COMMAND:
         if (LOWORD(wParam) == ID_BTN_NEXT) {
-            DownloadAndLoadCat(hwnd);
+            LoadCat(hwnd);
+        } else if (LOWORD(wParam) == ID_BTN_SAVE) {
+            SaveCurrentFile(hwnd);
         }
         break;
 
     case WM_SIZE: {
         int width = LOWORD(lParam);
         int height = HIWORD(lParam);
-        MoveWindow(hButton, width / 2 - 100, height - 50, 200, 40, TRUE);
+        MoveWindow(hButtonNext, 10, height - 45, 180, 35, TRUE);
+        MoveWindow(hButtonSave, 200, height - 45, 150, 35, TRUE);
         break;
     }
 
@@ -164,46 +283,65 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
 
-        FillRect(hdc, &ps.rcPaint, (HBRUSH)GetStockObject(WHITE_BRUSH));
+        RECT rect;
+        GetClientRect(hwnd, &rect);
+
+        // Двойная буферизация для устранения мерцания
+        HDC memDC = CreateCompatibleDC(hdc);
+        HBITMAP memBitmap = CreateCompatibleBitmap(hdc, rect.right, rect.bottom);
+        HBITMAP oldBitmap = (HBITMAP)SelectObject(memDC, memBitmap);
+
+        // Заливаем фон в памяти
+        FillRect(memDC, &rect, (HBRUSH)GetStockObject(WHITE_BRUSH));
 
         if (currentImage) {
             GpGraphics* graphics = NULL;
-            GdipCreateFromHDC(hdc, &graphics);
+            GdipCreateFromHDC(memDC, &graphics);
             GdipSetInterpolationMode(graphics, InterpolationModeHighQualityBicubic);
 
-            RECT rect;
-            GetClientRect(hwnd, &rect);
-            int winW = rect.right;
-            int winH = rect.bottom - 60;
+            // Область для картинки (отступаем сверху 40px и снизу 60px под кнопки)
+            int winW = rect.right - 20;
+            int winH = rect.bottom - 100;
 
-            UINT imgW = 0, imgH = 0;
-            GdipGetImageWidth(currentImage, &imgW);
-            GdipGetImageHeight(currentImage, &imgH);
+            if (winW > 0 && winH > 0) {
+                UINT imgW = 0, imgH = 0;
+                GdipGetImageWidth(currentImage, &imgW);
+                GdipGetImageHeight(currentImage, &imgH);
 
-            if (imgW > 0 && imgH > 0) {
-                float scaleW = (float)winW / imgW;
-                float scaleH = (float)winH / imgH;
-                float scale = min(scaleW, scaleH);
+                if (imgW > 0 && imgH > 0) {
+                    float scaleW = (float)winW / imgW;
+                    float scaleH = (float)winH / imgH;
+                    float scale = min(scaleW, scaleH);
 
-                int drawW = (int)(imgW * scale);
-                int drawH = (int)(imgH * scale);
-                int drawX = (winW - drawW) / 2;
-                int drawY = (winH - drawH) / 2;
+                    int drawW = (int)(imgW * scale);
+                    int drawH = (int)(imgH * scale);
+                    int drawX = (rect.right - drawW) / 2;
+                    int drawY = 40 + (winH - drawH) / 2;
 
-                GdipDrawImageRectI(graphics, currentImage, drawX, drawY, drawW, drawH);
+                    GdipDrawImageRectI(graphics, currentImage, drawX, drawY, drawW, drawH);
+                }
             }
             GdipDeleteGraphics(graphics);
         } else {
-            SetTextColor(hdc, RGB(255, 0, 0));
-            SetBkMode(hdc, TRANSPARENT);
-            const wchar_t* errText = wstr("Картинка не загружена.");
-            TextOutW(hdc, 20, 20, errText, wcslen(errText));
+            SetTextColor(memDC, RGB(255, 0, 0));
+            SetBkMode(memDC, TRANSPARENT);
+            TextOutW(memDC, 20, 50, L"Картинка не загружена.", 22);
         }
+
+        // Копируем готовую картинку из памяти на экран
+        BitBlt(hdc, 0, 0, rect.right, rect.bottom, memDC, 0, 0, SRCCOPY);
+
+        // Очистка памяти
+        SelectObject(memDC, oldBitmap);
+        DeleteObject(memBitmap);
+        DeleteDC(memDC);
+
         EndPaint(hwnd, &ps);
         break;
     }
 
     case WM_DESTROY:
+        StopGifAnimation(hwnd);
         if (currentImage) {
             GdipDisposeImage(currentImage);
             currentImage = NULL;
@@ -239,8 +377,7 @@ int main() {
     wc.lpszClassName = L"CatAppClass";
     RegisterClassExW(&wc);
 
-    // Устанавливаем правильный заголовок сразу при создании
-    HWND hwnd = CreateWindowExW(0, L"CatAppClass", wstr("Случайный мем с котиком"),
+    HWND hwnd = CreateWindowExW(0, L"CatAppClass", L"",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 800, 600,
         NULL, NULL, wc.hInstance, NULL);
