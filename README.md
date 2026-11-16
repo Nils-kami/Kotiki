@@ -2,7 +2,8 @@
 
 Просто приложение, которое генерирует случайных котов. Зачем? Потому что коты — это жизнь.
 
-![Котик](https://github.com/Nils-kami/Kotiki/raw/main/cat.jpg)
+<img width="282" height="200" alt="{ABDFAF04-2568-486E-8F3B-C02D84A6A99A}" src="https://github.com/user-attachments/assets/39359119-3597-4ef1-a3d3-435a4903b413" />
+
 
 ### Что умеет:
 * 🎲 **Рандом** — жмешь кнопку, получаешь нового кота.
