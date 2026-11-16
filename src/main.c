@@ -29,6 +29,7 @@
 ULONG_PTR gdiplusToken;
 GpImage*  currentImage = NULL;
 HWND hButtonNext, hButtonSave, hEditTag, hRadioImg, hRadioGif;
+
 #define ID_BTN_NEXT 101
 #define ID_BTN_SAVE 102
 #define ID_EDIT_TAG 103
@@ -42,7 +43,9 @@ UINT gifCurrentFrame = 0;
 UINT* gifFrameDelays = NULL;
 GUID gifFrameDimension;
 BOOL isGifLoaded = FALSE;
-WCHAR currentFilePath[MAX_PATH] = L"cat.jpg";
+
+// Буфер для хранения ПОЛНОГО (абсолютного) пути к текущему файлу
+WCHAR currentFilePath[MAX_PATH] = L"";
 
 // --- Прототипы ---
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -100,14 +103,17 @@ void LoadCat(HWND hwnd) {
         currentImage = NULL;
     }
 
+    // 1. Получаем тег
     WCHAR wTag[128] = L"";
     GetWindowTextW(hEditTag, wTag, 128);
     
     char utf8Tag[256] = "";
     WideCharToMultiByte(CP_UTF8, 0, wTag, -1, utf8Tag, 256, NULL, NULL);
 
+    // 2. Определяем формат
     BOOL wantGif = (SendMessage(hRadioGif, BM_GETCHECK, 0, 0) == BST_CHECKED);
 
+    // 3. Собираем URL
     char url[512];
     if (wantGif) {
         sprintf(url, "https://cataas.com/cat/gif?t=%d", (int)time(NULL));
@@ -119,6 +125,7 @@ void LoadCat(HWND hwnd) {
         }
     }
 
+    // 4. Скачиваем во временный файл
     SetWindowTextW(hwnd, L"Загрузка...");
     EnableWindow(hButtonNext, FALSE);
     
@@ -129,27 +136,32 @@ void LoadCat(HWND hwnd) {
         return;
     }
 
+    // 5. Формируем АБСОЛЮТНЫЙ путь для финального файла
     WCHAR wTempPath[MAX_PATH];
     GetFullPathNameW(L"cat.tmp", MAX_PATH, wTempPath, NULL);
     
-    WCHAR wFinalPath[MAX_PATH];
+    WCHAR wFileName[MAX_PATH];
     if (wantGif) {
-        wcscpy(wFinalPath, L"cat.gif");
+        wcscpy(wFileName, L"cat.gif");
     } else {
-        wcscpy(wFinalPath, L"cat.jpg");
+        wcscpy(wFileName, L"cat.jpg");
     }
-    wcscpy(currentFilePath, wFinalPath);
+    
+    // Сохраняем полный путь (например, D:\ИИ\котики\bin\cat.jpg)
+    GetFullPathNameW(wFileName, MAX_PATH, currentFilePath, NULL);
 
-    DeleteFileW(wFinalPath);
-    MoveFileW(wTempPath, wFinalPath);
+    DeleteFileW(currentFilePath);
+    MoveFileW(wTempPath, currentFilePath);
 
-    GpStatus status = GdipLoadImageFromFile(wFinalPath, &currentImage);
+    // 6. Загружаем в GDI+
+    GpStatus status = GdipLoadImageFromFile(currentFilePath, &currentImage);
     if (status != Ok) {
         MessageBoxW(hwnd, L"Не удалось прочитать файл.", L"Ошибка", MB_ICONERROR);
         EnableWindow(hButtonNext, TRUE);
         return;
     }
 
+    // 7. Настраиваем анимацию, если это GIF
     if (wantGif) {
         UINT count = 0;
         GdipImageGetFrameDimensionsCount(currentImage, &count);
@@ -185,7 +197,7 @@ void LoadCat(HWND hwnd) {
 
     EnableWindow(hButtonNext, TRUE);
     SetWindowTextW(hwnd, L"Случайный мем с котиком");
-    InvalidateRect(hwnd, NULL, FALSE); // FALSE для предотвращения лишней очистки фона
+    InvalidateRect(hwnd, NULL, FALSE);
 }
 
 // --- Сохранение ---
@@ -218,10 +230,14 @@ void SaveCurrentFile(HWND hwnd) {
     ofn.Flags = OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY;
     
     if (GetSaveFileNameW(&ofn)) {
+        // Копируем по АБСОЛЮТНОМУ пути
         if (CopyFileW(currentFilePath, ofn.lpstrFile, FALSE)) {
             MessageBoxW(hwnd, L"Файл успешно сохранен!", L"Успех", MB_ICONINFORMATION);
         } else {
-            MessageBoxW(hwnd, L"Не удалось скопировать файл.", L"Ошибка", MB_ICONERROR);
+            DWORD err = GetLastError();
+            WCHAR errMsg[256];
+            swprintf(errMsg, 256, L"Не удалось скопировать файл.\nКод ошибки Windows: %lu", err);
+            MessageBoxW(hwnd, errMsg, L"Ошибка", MB_ICONERROR);
         }
     }
 }
@@ -232,13 +248,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_CREATE:
         SetWindowTextW(hwnd, L"Случайный мем с котиком");
 
+        // Поле ввода тега
         CreateWindowW(L"STATIC", L"Тег:", WS_VISIBLE | WS_CHILD, 10, 10, 40, 25, hwnd, NULL, NULL, NULL);
         hEditTag = CreateWindowW(L"EDIT", L"", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL, 50, 10, 150, 25, hwnd, (HMENU)ID_EDIT_TAG, NULL, NULL);
 
+        // Радиокнопки
         hRadioImg = CreateWindowW(L"BUTTON", L"Картинка", WS_VISIBLE | WS_CHILD | BS_AUTORADIOBUTTON | WS_GROUP, 220, 10, 100, 25, hwnd, (HMENU)ID_RADIO_IMG, NULL, NULL);
         hRadioGif = CreateWindowW(L"BUTTON", L"GIF", WS_VISIBLE | WS_CHILD | BS_AUTORADIOBUTTON, 330, 10, 60, 25, hwnd, (HMENU)ID_RADIO_GIF, NULL, NULL);
         SendMessage(hRadioImg, BM_SETCHECK, BST_CHECKED, 0);
 
+        // Кнопки
         hButtonNext = CreateWindowW(L"BUTTON", L"Следующий котик", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 10, 500, 180, 35, hwnd, (HMENU)ID_BTN_NEXT, NULL, NULL);
         hButtonSave = CreateWindowW(L"BUTTON", L"Сохранить", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 200, 500, 150, 35, hwnd, (HMENU)ID_BTN_SAVE, NULL, NULL);
 
@@ -286,12 +305,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         RECT rect;
         GetClientRect(hwnd, &rect);
 
-        // Двойная буферизация для устранения мерцания
+        // Двойная буферизация (защита от мерцания)
         HDC memDC = CreateCompatibleDC(hdc);
         HBITMAP memBitmap = CreateCompatibleBitmap(hdc, rect.right, rect.bottom);
         HBITMAP oldBitmap = (HBITMAP)SelectObject(memDC, memBitmap);
 
-        // Заливаем фон в памяти
         FillRect(memDC, &rect, (HBRUSH)GetStockObject(WHITE_BRUSH));
 
         if (currentImage) {
@@ -299,7 +317,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             GdipCreateFromHDC(memDC, &graphics);
             GdipSetInterpolationMode(graphics, InterpolationModeHighQualityBicubic);
 
-            // Область для картинки (отступаем сверху 40px и снизу 60px под кнопки)
             int winW = rect.right - 20;
             int winH = rect.bottom - 100;
 
@@ -328,10 +345,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             TextOutW(memDC, 20, 50, L"Картинка не загружена.", 22);
         }
 
-        // Копируем готовую картинку из памяти на экран
+        // Переносим из памяти на экран
         BitBlt(hdc, 0, 0, rect.right, rect.bottom, memDC, 0, 0, SRCCOPY);
 
-        // Очистка памяти
+        // Очистка
         SelectObject(memDC, oldBitmap);
         DeleteObject(memBitmap);
         DeleteDC(memDC);
